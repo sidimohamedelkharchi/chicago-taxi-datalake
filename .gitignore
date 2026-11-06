@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+.tmp_dagster_home*/
+data/raw/*
+!data/raw/.gitkeep
+spark-warehouse/
+metastore_db/

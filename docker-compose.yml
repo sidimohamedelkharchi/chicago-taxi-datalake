@@ -1,0 +1,102 @@
+name: chicago-taxi-datalake
+
+x-pipeline-image: &pipeline-image
+  image: chicago-taxi-pipeline:latest
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  env_file: .env
+
+x-dagster-env: &dagster-env
+  DAGSTER_POSTGRES_HOST: postgres
+  DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
+  DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  DAGSTER_POSTGRES_DB: ${POSTGRES_DB}
+
+services:
+  # ---------------------------------------------------------------- storage
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  init-storage:
+    <<: *pipeline-image
+    command: python -m pipeline.init_storage
+    depends_on:
+      minio: { condition: service_healthy }
+    restart: "no"
+
+  # ---------------------------------------------------------------- spark
+  spark-master:
+    <<: *pipeline-image
+    hostname: spark-master
+    command: spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    ports: ["8080:8080"]
+
+  spark-worker:
+    <<: *pipeline-image
+    command: >
+      spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+      --cores ${SPARK_WORKER_CORES:-4} --memory ${SPARK_WORKER_MEMORY:-4g} --webui-port 8081
+    ports: ["8081:8081"]
+    depends_on: [spark-master]
+
+  # ---------------------------------------------------------------- orchestration
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  dagster-webserver:
+    <<: *pipeline-image
+    command: dagster-webserver -h 0.0.0.0 -p 3000 -w /opt/dagster/dagster_home/workspace.yaml
+    environment: *dagster-env
+    ports: ["3000:3000"]
+    volumes: ["./data/raw:/opt/data/raw", "dagster-storage:/opt/dagster/dagster_home/storage"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      init-storage: { condition: service_completed_successfully }
+
+  dagster-daemon:
+    <<: *pipeline-image
+    hostname: dagster-daemon
+    # Runs (and therefore Spark drivers) are launched from this container.
+    command: dagster-daemon run -w /opt/dagster/dagster_home/workspace.yaml
+    environment: *dagster-env
+    ports: ["4040:4040"] # Spark UI of the running job
+    volumes: ["./data/raw:/opt/data/raw", "dagster-storage:/opt/dagster/dagster_home/storage"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      init-storage: { condition: service_completed_successfully }
+      spark-worker: { condition: service_started }
+
+  # ---------------------------------------------------------------- exposition
+  dashboard:
+    <<: *pipeline-image
+    command: streamlit run dashboard/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    ports: ["8501:8501"]
+    depends_on:
+      init-storage: { condition: service_completed_successfully }
+
+volumes:
+  minio-data:
+  postgres-data:
+  dagster-storage: # compute logs shared by webserver & daemon

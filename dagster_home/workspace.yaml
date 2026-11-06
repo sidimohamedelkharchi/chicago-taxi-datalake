@@ -1,0 +1,5 @@
+load_from:
+  - python_module:
+      module_name: pipeline.definitions
+      working_directory: /opt/project
+      location_name: chicago_taxi
